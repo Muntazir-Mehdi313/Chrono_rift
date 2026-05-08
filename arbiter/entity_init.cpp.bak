@@ -1,0 +1,24 @@
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+#include "shared_types.h"
+
+void initialize_entities(SharedGameState* shm, int roll_number) {
+    std::cout << "[INIT] Seeding world with roll number: " << roll_number << std::endl;
+    srand(roll_number);
+
+    // Initialize 4 Players
+    const char* names[] = {"Aether", "Lumina", "Drax", "Kael"};
+    for(int i=0; i<4; i++) {
+        snprintf(shm->players[i].name, 32, "%s", names[i]);
+        shm->players[i].max_hp = 847 + (rand() % 200); // Using your 847 base
+        shm->players[i].hp = shm->players[i].max_hp;
+        shm->players[i].base_damage = 7 + 10; // 17
+        shm->players[i].speed = 25;
+        shm->players[i].is_alive = 1;
+        std::cout << "[INIT] Player " << i << ": " << shm->players[i].name << " HP: " << shm->players[i].hp << std::endl;
+    }
+    
+    shm->num_players = 4;
+    shm->num_npcs_concurrent = 3;
+}

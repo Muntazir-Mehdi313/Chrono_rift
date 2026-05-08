@@ -1,0 +1,31 @@
+[0;34m
+  ╔══════════════════════════════════════════════════╗
+  ║  CHRONO RIFT — ENHANCED TEST SUITE v2          ║
+  ║  CS 2006 OS | Roll: 24i-0847                   ║
+  ╚══════════════════════════════════════════════════╝
+[0m
+
+[0;34m━━━ PHASE 1-3: Build & Binary Check ━━━[0m
+  [0;36mℹ[0m  Building...
+  [0;32m✓ PASS[0m  Build succeeded
+  [0;31m✗ FAIL[0m  Build FAILED
+[MAKE] Syncing headers...
+cp arbiter/shared_types.h hip/shared_types.h
+cp arbiter/shared_types.h asp/shared_types.h
+[MAKE] Building arbiter...
+g++ -Wall -Wextra -std=c++17 -pthread arbiter/*.cpp -o bin/arbiter -lsfml-graphics -lsfml-window -lsfml-system -lrt
+arbiter/inventory_allocator.cpp:65:12: warning: 'int count_total_free(const int*)' defined but not used [-Wunused-function]
+   65 | static int count_total_free(const int* inventory) {
+      |            ^~~~~~~~~~~~~~~~
+[MAKE] arbiter built.
+[MAKE] Building hip...
+g++ -Wall -Wextra -std=c++17 -pthread hip/*.cpp -o bin/hip -lsfml-graphics -lsfml-window -lsfml-system -lrt
+[MAKE] hip built.
+[MAKE] Building asp...
+g++ -Wall -Wextra -std=c++17 -pthread asp/*.cpp -o bin/asp -lsfml-graphics -lsfml-window -lsfml-system -lrt
+[MAKE] asp built.
+
+============================================
+  Build complete.
+  Run: ./bin/arbiter & sleep 0.5 && ./bin/hip & ./bin/asp &
+============================================

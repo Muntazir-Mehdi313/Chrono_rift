@@ -1,0 +1,515 @@
+// ============================================================================
+// arbiter/game_loop.cpp — Phases 7-17: Full Scheduler + All Systems Wired
+// CS 2006 Operating Systems | Spring 2026 | Chrono Rift
+// Roll Number: 24i-0847  |  Partner: 24i-0650
+//
+// WHAT THIS FILE ADDS vs Phase 13 version:
+//   Phase 14: check_eclipse_relic_spawn() hooked into handle_npc_death ✓
+//   Phase 15: deadlock_monitor thread launched at game start ✓
+//   Phase 16: render_thread launched at game start ✓
+//   Phase 17: graceful shutdown — join all threads, signal HIP/ASP ✓
+// ============================================================================
+
+#include <iostream>
+#include <unistd.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <cerrno>
+#include <ctime>
+#include <cstring>
+#include <cstdlib>
+#include "shared_types.h"
+
+// ── Forward declarations ──────────────────────────────────────────────────
+void init_npc(Entity* n, int slot_index, int total_npcs_spawned);
+void append_action_log(SharedGameState* shm, const char* message);
+void check_game_conditions(SharedGameState* shm);
+void try_apply_stun(SharedGameState* shm, int weapon_id, int target_is_player, int target_slot);
+int  can_use_ultimate(SharedGameState* shm, int player_slot);
+void trigger_ultimate_ability(SharedGameState* shm);
+int  arbiter_check_quit();
+// Phase 12/13
+int  inventory_add_weapon(SharedGameState* shm, Entity* e, int player_slot, int weapon_id);
+int  execute_swap_in(SharedGameState* shm, int player_slot, int weapon_id);
+int  roll_weapon_drop();
+void present_drop_to_players(SharedGameState* shm, int weapon_id);
+void player_pickup_weapon(SharedGameState* shm, int player_slot, int weapon_id);
+void npc_pickup_weapon(SharedGameState* shm, int weapon_id);
+// Phase 14
+void check_eclipse_relic_spawn(SharedGameState* shm);
+// Phase 15
+void launch_deadlock_monitor(SharedGameState* shm, pthread_t* out_thread);
+// Phase 16
+void launch_render_thread(SharedGameState* shm, pthread_t* out_thread);
+
+#define ACTION_ULTIMATE 7
+#define TICK_MS  100
+#define TICK_SEC 0.1f
+
+// ── Thread handles (need for Phase 17 join) ───────────────────────────────
+static pthread_t g_deadlock_thread;
+static pthread_t g_render_thread;
+static pthread_t g_tick_thread;
+
+// ============================================================================
+// append_action_log()
+// ============================================================================
+void append_action_log(SharedGameState* shm, const char* message) {
+    pthread_mutex_lock(&shm->log_mutex);
+    int slot;
+    if (shm->log_count < ACTION_LOG_LINES) {
+        slot = (shm->log_head + shm->log_count) % ACTION_LOG_LINES;
+        shm->log_count++;
+    } else {
+        slot = shm->log_head;
+        shm->log_head = (shm->log_head + 1) % ACTION_LOG_LINES;
+    }
+    strncpy(shm->action_log[slot], message, ACTION_LOG_WIDTH - 1);
+    shm->action_log[slot][ACTION_LOG_WIDTH - 1] = '\0';
+    pthread_mutex_unlock(&shm->log_mutex);
+}
+
+// ============================================================================
+// check_game_conditions()
+// ============================================================================
+void check_game_conditions(SharedGameState* shm) {
+    pthread_mutex_lock(&shm->master_mutex);
+    if (shm->game_result != GAME_ONGOING) {
+        pthread_mutex_unlock(&shm->master_mutex); return;
+    }
+    if (shm->total_kills >= 10) {
+        shm->game_result = GAME_WIN;
+        pthread_mutex_unlock(&shm->master_mutex);
+        append_action_log(shm, "*** VICTORY! 10 enemies defeated! ***");
+        std::cout << "\n[ARBITER] *** VICTORY! ***\n"; return;
+    }
+    int alive = 0;
+    for (int i = 0; i < shm->num_players; i++)
+        if (shm->players[i].is_alive) alive++;
+    if (alive == 0) {
+        shm->game_result = GAME_LOSE;
+        pthread_mutex_unlock(&shm->master_mutex);
+        append_action_log(shm, "*** DEFEAT! All players fallen! ***");
+        std::cout << "\n[ARBITER] *** DEFEAT! ***\n"; return;
+    }
+    pthread_mutex_unlock(&shm->master_mutex);
+}
+
+// ============================================================================
+// handle_npc_death() — Phase 9 + 13 + 14
+// ============================================================================
+static void handle_npc_death(SharedGameState* shm, int npc_slot) {
+    char log_msg[ACTION_LOG_WIDTH];
+
+    pthread_mutex_lock(&shm->master_mutex);
+    int npc_id = shm->npcs[npc_slot].id;
+    int kills  = shm->total_kills;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    snprintf(log_msg, ACTION_LOG_WIDTH, "NPC %d defeated! Kills: %d/10", npc_id, kills);
+    append_action_log(shm, log_msg);
+    std::cout << "[ARBITER] " << log_msg << "\n";
+
+    // Phase 13: weapon drop
+    int dropped = roll_weapon_drop();
+    if (dropped != WEAPON_NONE) {
+        pthread_mutex_lock(&shm->master_mutex);
+        bool already = (shm->drop_awaiting_player_choice != 0);
+        pthread_mutex_unlock(&shm->master_mutex);
+        if (!already) present_drop_to_players(shm, dropped);
+    }
+
+    // Release all artifacts held by this NPC (Phase 14)
+    pthread_mutex_lock(&shm->resources.table_mutex);
+    if (shm->resources.solar_core_holder    == npc_id) shm->resources.solar_core_holder    = -1;
+    if (shm->resources.lunar_blade_holder   == npc_id) shm->resources.lunar_blade_holder   = -1;
+    if (shm->resources.eclipse_relic_holder == npc_id) shm->resources.eclipse_relic_holder = -1;
+    pthread_mutex_unlock(&shm->resources.table_mutex);
+
+    // Respawn
+    pthread_mutex_lock(&shm->master_mutex);
+    if (shm->total_kills < 10) {
+        init_npc(&shm->npcs[npc_slot], npc_slot, shm->total_npcs_spawned);
+        shm->total_npcs_spawned++;
+        snprintf(log_msg, ACTION_LOG_WIDTH, "New enemy: NPC %d (HP=%d SPD=%d)",
+                 shm->npcs[npc_slot].id, shm->npcs[npc_slot].hp, shm->npcs[npc_slot].speed);
+        pthread_mutex_unlock(&shm->master_mutex);
+        append_action_log(shm, log_msg);
+    } else {
+        pthread_mutex_unlock(&shm->master_mutex);
+    }
+
+    // Phase 14: check if Eclipse Relic should spawn
+    check_eclipse_relic_spawn(shm);
+}
+
+// ============================================================================
+// apply_player_action() — Phases 8, 10, 11, 12, 13
+// ============================================================================
+static int apply_player_action(SharedGameState* shm, int ps) {
+    char log_msg[ACTION_LOG_WIDTH];
+    pthread_mutex_lock(&shm->master_mutex);
+    int action = shm->players[ps].action_type;
+    int tslot  = shm->players[ps].action_target_id;
+    int wslot  = shm->players[ps].action_weapon_slot;
+    int ltwid  = shm->players[ps].action_lt_weapon_id;
+    int bdmg   = shm->players[ps].base_damage;
+    int maxhp  = shm->players[ps].max_hp;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    int is_skip = 0;
+
+    switch (action) {
+    case ACTION_ATTACK_STRIKE: {
+        pthread_mutex_lock(&shm->master_mutex);
+        Entity* t = (tslot>=0 && tslot<shm->num_npcs_concurrent && shm->npcs[tslot].is_alive)
+                    ? &shm->npcs[tslot] : nullptr;
+        if (t) {
+            t->hp -= bdmg;
+            if (t->hp <= 0) {
+                t->hp = 0; t->is_alive = STATUS_DEAD; shm->total_kills++;
+                snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d STRIKES NPC %d for %d — KILLED! (%d/10)",
+                         ps,t->id,bdmg,shm->total_kills);
+                int s = tslot;
+                pthread_mutex_unlock(&shm->master_mutex);
+                append_action_log(shm,log_msg); handle_npc_death(shm,s);
+            } else {
+                snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d STRIKES NPC %d for %d (HP %d/%d)",
+                         ps,t->id,bdmg,t->hp,t->max_hp);
+                pthread_mutex_unlock(&shm->master_mutex);
+                append_action_log(shm,log_msg);
+            }
+        } else {
+            pthread_mutex_unlock(&shm->master_mutex);
+            append_action_log(shm,"Strike missed — target dead");
+        }
+        break;
+    }
+    case ACTION_ATTACK_EXHAUST: {
+        pthread_mutex_lock(&shm->master_mutex);
+        Entity* t = (tslot>=0&&tslot<shm->num_npcs_concurrent&&shm->npcs[tslot].is_alive)
+                    ?&shm->npcs[tslot]:nullptr;
+        if (t) {
+            t->stamina -= bdmg; if(t->stamina<0)t->stamina=0;
+            snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d EXHAUSTS NPC %d (stam %.0f/%d)",
+                     ps,t->id,t->stamina,t->max_stamina);
+        } else snprintf(log_msg,ACTION_LOG_WIDTH,"Exhaust missed — target dead");
+        pthread_mutex_unlock(&shm->master_mutex); append_action_log(shm,log_msg);
+        break;
+    }
+    case ACTION_USE_WEAPON: {
+        pthread_mutex_lock(&shm->master_mutex);
+        int wid = (wslot>=0&&wslot<INVENTORY_SLOTS) ? shm->players[ps].inventory[wslot] : WEAPON_NONE;
+        Entity* t = (tslot>=0&&tslot<shm->num_npcs_concurrent&&shm->npcs[tslot].is_alive)
+                    ?&shm->npcs[tslot]:nullptr;
+        if (wid!=WEAPON_NONE&&t) {
+            int dmg=weapon_damage[wid]; t->hp-=dmg;
+            if(t->hp<=0){
+                t->hp=0;t->is_alive=STATUS_DEAD;shm->total_kills++;int s=tslot;
+                snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d uses %s on NPC %d for %d — KILLED! (%d/10)",
+                         ps,weapon_name[wid],t->id,dmg,shm->total_kills);
+                pthread_mutex_unlock(&shm->master_mutex);
+                append_action_log(shm,log_msg);
+                try_apply_stun(shm,wid,0,s); handle_npc_death(shm,s);
+            } else {
+                int hp_now=t->hp,hp_max=t->max_hp,tid=t->id;
+                pthread_mutex_unlock(&shm->master_mutex);
+                snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d uses %s on NPC %d for %d (HP %d/%d)",
+                         ps,weapon_name[wid],tid,dmg,hp_now,hp_max);
+                append_action_log(shm,log_msg);
+                try_apply_stun(shm,wid,0,tslot);
+            }
+        } else {
+            pthread_mutex_unlock(&shm->master_mutex);
+            append_action_log(shm,"Use Weapon: invalid weapon or target");
+        }
+        break;
+    }
+    case ACTION_SWAP_IN: {
+        execute_swap_in(shm, ps, ltwid);
+        break;
+    }
+    case ACTION_HEAL: {
+        pthread_mutex_lock(&shm->master_mutex);
+        int heal=maxhp/10; shm->players[ps].hp+=heal;
+        if(shm->players[ps].hp>maxhp)shm->players[ps].hp=maxhp;
+        snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d HEALS %d HP (now %d/%d)",
+                 ps,heal,shm->players[ps].hp,maxhp);
+        pthread_mutex_unlock(&shm->master_mutex); append_action_log(shm,log_msg);
+        break;
+    }
+    case ACTION_SKIP: {
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->players[ps].stamina=shm->players[ps].max_stamina*0.5f;
+        pthread_mutex_unlock(&shm->master_mutex);
+        snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d SKIPs — stamina → 50",ps);
+        append_action_log(shm,log_msg); is_skip=1; break;
+    }
+    case ACTION_ULTIMATE: {
+        if(can_use_ultimate(shm,ps)){
+            trigger_ultimate_ability(shm);
+            snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d ★ ULTIMATE! ASP suspended 10s",ps);
+        } else {
+            snprintf(log_msg,ACTION_LOG_WIDTH,"Player %d: Ultimate needs Solar Core + Lunar Blade",ps);
+        }
+        append_action_log(shm,log_msg); break;
+    }
+    default:
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->players[ps].stamina=shm->players[ps].max_stamina*0.5f;
+        pthread_mutex_unlock(&shm->master_mutex); is_skip=1; break;
+    }
+
+    if (action != ACTION_SWAP_IN) {
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->players[ps].just_swapped_in_weapon = WEAPON_NONE;
+        pthread_mutex_unlock(&shm->master_mutex);
+    }
+    return is_skip;
+}
+
+// ============================================================================
+// apply_npc_action() — Phase 9
+// ============================================================================
+static int apply_npc_action(SharedGameState* shm, int ns) {
+    char log_msg[ACTION_LOG_WIDTH];
+    pthread_mutex_lock(&shm->master_mutex);
+    int action=shm->npcs[ns].action_type, target=shm->npcs[ns].action_target_id;
+    int npc_id=shm->npcs[ns].id, bdmg=shm->npcs[ns].base_damage;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    int is_skip=0;
+    switch(action){
+    case ACTION_ATTACK_STRIKE:{
+        pthread_mutex_lock(&shm->master_mutex);
+        Entity* t=(target>=0&&target<shm->num_players&&shm->players[target].is_alive)
+                  ?&shm->players[target]:nullptr;
+        if(t){
+            t->hp-=bdmg;
+            if(t->hp<=0){t->hp=0;t->is_alive=STATUS_DEAD;
+                snprintf(log_msg,ACTION_LOG_WIDTH,"NPC %d STRIKES Player %d for %d — PLAYER KILLED!",
+                         npc_id,target,bdmg);
+            } else snprintf(log_msg,ACTION_LOG_WIDTH,"NPC %d STRIKES Player %d for %d (HP %d/%d)",
+                            npc_id,target,bdmg,t->hp,t->max_hp);
+        } else snprintf(log_msg,ACTION_LOG_WIDTH,"NPC %d Strike missed",npc_id);
+        pthread_mutex_unlock(&shm->master_mutex); append_action_log(shm,log_msg); break;
+    }
+    case ACTION_SKIP:{
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->npcs[ns].stamina=shm->npcs[ns].max_stamina*0.5f;
+        pthread_mutex_unlock(&shm->master_mutex);
+        snprintf(log_msg,ACTION_LOG_WIDTH,"NPC %d SKIPs — stamina → 75",npc_id);
+        append_action_log(shm,log_msg); is_skip=1; break;
+    }
+    default:
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->npcs[ns].stamina=shm->npcs[ns].max_stamina*0.5f;
+        pthread_mutex_unlock(&shm->master_mutex); is_skip=1; break;
+    }
+    return is_skip;
+}
+
+// ============================================================================
+// stamina_tick_thread() — Phase 7
+// ============================================================================
+static void* stamina_tick_thread(void* arg){
+    SharedGameState* shm=(SharedGameState*)arg;
+    while(shm->game_result==GAME_ONGOING){
+        usleep(TICK_MS*1000);
+        pthread_mutex_lock(&shm->master_mutex);
+        if(shm->turn.action_in_progress||shm->ultimate_active){
+            pthread_mutex_unlock(&shm->master_mutex); continue;
+        }
+        for(int i=0;i<shm->num_players;i++){
+            Entity* p=&shm->players[i];
+            if(!p->is_alive||p->is_stunned)continue;
+            p->stamina+=p->speed*TICK_SEC;
+            if(p->stamina>(float)p->max_stamina)p->stamina=(float)p->max_stamina;
+        }
+        for(int i=0;i<shm->num_npcs_concurrent;i++){
+            Entity* n=&shm->npcs[i];
+            if(!n->is_alive||n->is_stunned)continue;
+            n->stamina+=n->speed*TICK_SEC;
+            if(n->stamina>(float)n->max_stamina)n->stamina=(float)n->max_stamina;
+        }
+        pthread_mutex_unlock(&shm->master_mutex);
+    }
+    return nullptr;
+}
+
+// ============================================================================
+// dispatch_turn() — Phases 7, 13
+// ============================================================================
+static void dispatch_turn(SharedGameState* shm, int entity_id, int is_player, int slot){
+    char log_msg[ACTION_LOG_WIDTH];
+    snprintf(log_msg,ACTION_LOG_WIDTH,"--- %s %d turn (slot %d) ---",
+             is_player?"Player":"NPC",entity_id,slot);
+    append_action_log(shm,log_msg);
+    std::cout<<"[ARBITER] "<<log_msg<<"\n";
+
+    pthread_mutex_lock(&shm->master_mutex);
+    shm->turn.current_entity_id=entity_id;
+    shm->turn.current_entity_is_player=is_player;
+    shm->turn.current_entity_slot=slot;
+    shm->turn.action_in_progress=1;
+    shm->turn.waiting_for_input=1;
+    if(is_player)shm->players[slot].action_ready=0;
+    else shm->npcs[slot].action_ready=0;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    sem_post(&shm->turn.turn_notification);
+
+    int is_skip=0;
+    if(!is_player){
+        struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); ts.tv_sec+=3;
+        int rc=sem_timedwait(&shm->turn.action_submitted,&ts);
+        if(rc==-1&&errno==ETIMEDOUT){
+            pthread_mutex_lock(&shm->master_mutex);
+            shm->npcs[slot].action_type=ACTION_SKIP;
+            shm->npcs[slot].action_ready=1;
+            pthread_mutex_unlock(&shm->master_mutex);
+            append_action_log(shm,"NPC timed out — auto Skip");
+        }
+    } else {
+        int ret; do{ret=sem_wait(&shm->turn.action_submitted);}while(ret==-1&&errno==EINTR);
+    }
+
+    // Phase 13: handle drop response (state 2=yes, 3=no)
+    pthread_mutex_lock(&shm->master_mutex);
+    int drop_state = shm->drop_awaiting_player_choice;
+    int drop_wid   = shm->dropped_weapon_id;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    if (drop_state == 2 && is_player) {
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->drop_awaiting_player_choice = 0;
+        pthread_mutex_unlock(&shm->master_mutex);
+        player_pickup_weapon(shm, slot, drop_wid);
+    } else if (drop_state == 3) {
+        pthread_mutex_lock(&shm->master_mutex);
+        shm->drop_awaiting_player_choice = 0;
+        pthread_mutex_unlock(&shm->master_mutex);
+        npc_pickup_weapon(shm, drop_wid);
+    }
+
+    if(is_player) is_skip=apply_player_action(shm,slot);
+    else          is_skip=apply_npc_action(shm,slot);
+
+    pthread_mutex_lock(&shm->master_mutex);
+    if(!is_skip){
+        if(is_player)shm->players[slot].stamina=0.0f;
+        else shm->npcs[slot].stamina=0.0f;
+    }
+    shm->turn.action_in_progress=0;
+    shm->turn.waiting_for_input=0;
+    pthread_mutex_unlock(&shm->master_mutex);
+
+    check_game_conditions(shm);
+}
+
+// ============================================================================
+// main_game_loop() — Phases 7-17
+// ============================================================================
+void main_game_loop(SharedGameState* shm){
+    std::cout<<"\n[ARBITER] Scheduling engine starting (Phases 7-17).\n";
+    append_action_log(shm,"Game started! Stamina accumulating...");
+
+    // ── Phase 16: Launch SFML render thread ──────────────────────────────
+    launch_render_thread(shm, &g_render_thread);
+
+    // ── Phase 15: Launch deadlock monitor thread ──────────────────────────
+    launch_deadlock_monitor(shm, &g_deadlock_thread);
+
+    // ── Phase 7: Launch stamina tick thread ───────────────────────────────
+    pthread_create(&g_tick_thread, nullptr, stamina_tick_thread, shm);
+    std::cout<<"[ARBITER] Stamina tick thread launched.\n";
+
+    // Print initial stats
+    std::cout<<"[ARBITER] Players:\n";
+    for(int i=0;i<shm->num_players;i++){
+        Entity* p=&shm->players[i];
+        std::cout<<"  P"<<i<<" HP="<<p->hp<<" DMG="<<p->base_damage
+                 <<" SPD="<<p->speed<<" ArrivalTime="<<(p->max_stamina/p->speed)<<"s\n";
+    }
+    std::cout<<"[ARBITER] NPCs:\n";
+    for(int i=0;i<shm->num_npcs_concurrent;i++){
+        Entity* n=&shm->npcs[i];
+        std::cout<<"  NPC"<<n->id<<" HP="<<n->hp<<" DMG="<<n->base_damage
+                 <<" SPD="<<n->speed<<" ArrivalTime="<<(n->max_stamina/n->speed)<<"s\n";
+    }
+    std::cout<<"\n";
+
+    // ── Main scheduling loop ──────────────────────────────────────────────
+    while(shm->game_result==GAME_ONGOING){
+
+        // Phase 17: quit check
+        if(arbiter_check_quit()){
+            pthread_mutex_lock(&shm->master_mutex);
+            shm->game_result=GAME_QUIT;
+            pthread_mutex_unlock(&shm->master_mutex);
+            append_action_log(shm,"Game quit by player (SIGTERM)");
+            std::cout<<"[ARBITER] GAME_QUIT set.\n";
+            sem_post(&shm->turn.action_submitted);
+            break;
+        }
+
+        int acting_id=-1, acting_player=-1, acting_slot=-1;
+        pthread_mutex_lock(&shm->master_mutex);
+        for(int i=0;i<shm->num_players;i++){
+            Entity* p=&shm->players[i];
+            if(!p->is_alive||p->is_stunned||p->stamina<(float)p->max_stamina)continue;
+            if(acting_id==-1||p->id<acting_id){acting_id=p->id;acting_player=1;acting_slot=i;}
+        }
+        for(int i=0;i<shm->num_npcs_concurrent;i++){
+            Entity* n=&shm->npcs[i];
+            if(!n->is_alive||n->is_stunned||n->stamina<(float)n->max_stamina)continue;
+            if(acting_id==-1||n->id<acting_id){acting_id=n->id;acting_player=0;acting_slot=i;}
+        }
+        pthread_mutex_unlock(&shm->master_mutex);
+
+        if(acting_id==-1){usleep(10000);continue;}
+        dispatch_turn(shm,acting_id,acting_player,acting_slot);
+    }
+
+    // ============================================================
+    // Phase 17 — GRACEFUL SHUTDOWN
+    // ============================================================
+    std::cout<<"\n[ARBITER] Game over. Initiating graceful shutdown...\n";
+
+    // 1. Unblock all waiting semaphores so threads can exit
+    for(int i=0;i<16;i++){
+        sem_post(&shm->turn.turn_notification);
+        sem_post(&shm->turn.action_submitted);
+    }
+
+    // 2. Signal HIP and ASP to terminate
+    if(shm->hip_pid>0){
+        kill(shm->hip_pid, SIGTERM);
+        std::cout<<"[ARBITER] SIGTERM → HIP (pid="<<shm->hip_pid<<")\n";
+    }
+    if(shm->asp_pid>0){
+        kill(shm->asp_pid, SIGTERM);
+        std::cout<<"[ARBITER] SIGTERM → ASP (pid="<<shm->asp_pid<<")\n";
+    }
+
+    // 3. Join background threads
+    std::cout<<"[ARBITER] Joining tick thread...\n";
+    pthread_join(g_tick_thread, nullptr);
+
+    std::cout<<"[ARBITER] Joining deadlock monitor thread...\n";
+    pthread_join(g_deadlock_thread, nullptr);
+
+    std::cout<<"[ARBITER] Joining render thread...\n";
+    pthread_join(g_render_thread, nullptr);
+
+    // 4. Print final result
+    std::cout<<"[ARBITER] Result: ";
+    switch(shm->game_result){
+        case GAME_WIN:  std::cout<<"WIN\n";  break;
+        case GAME_LOSE: std::cout<<"LOSE\n"; break;
+        case GAME_QUIT: std::cout<<"QUIT\n"; break;
+        default: std::cout<<shm->game_result<<"\n";
+    }
+    std::cout<<"[ARBITER] All threads joined. Returning to main for shm cleanup.\n";
+}
